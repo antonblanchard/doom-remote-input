@@ -156,22 +156,15 @@ static void *tcp_to_serial_thread(void* arg)
 }
 
 // Thread to read from serial port and write to TCP socket
-static void *serial_to_tcp_thread(void* arg)
+static void *serial_to_stdout_thread(void* arg)
 {
     char buffer[TX_BUFFER_SIZE];
     ssize_t bytes_read;
     while ((bytes_read = read(serial_port_fd, buffer, sizeof(buffer))) > 0) {
-#if 0
-        if (send(tcp_socket_fd, buffer, bytes_read, 0) != bytes_read) {
-            perror("write");
-            exit(1);
-        }
-#else
         if (write(STDOUT_FILENO, buffer, bytes_read) != bytes_read) {
             perror("write");
             exit(1);
         }
-#endif
     }
 
     return NULL;
@@ -260,31 +253,36 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    pthread_t serial_thread;
+    pthread_create(&serial_thread, NULL, serial_to_stdout_thread, NULL);
     printf("Server listening on port %d and forwarding to %s...\n", port, device);
 
-    int addrlen = sizeof(address);
-    int new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
-    if (new_socket < 0) {
-        perror("Accept failed");
-        close(server_fd);
-        close(serial_port_fd);
-        return 1;
+    // Main server loop - accept connections continuously
+    while (1) {
+        int addrlen = sizeof(address);
+        printf("Waiting for connection...\n");
+
+        int new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+        if (new_socket < 0) {
+            perror("Accept failed");
+            continue; // Try to accept next connection instead of exiting
+        }
+        tcp_socket_fd = new_socket;
+
+        printf("Connection accepted from %s:%d. Starting forwarding...\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
+
+        pthread_t tcp_thread;
+        pthread_create(&tcp_thread, NULL, tcp_to_serial_thread, NULL);
+
+        // Wait for threads to finish (connection closed)
+        pthread_join(tcp_thread, NULL);
+
+        close(new_socket);
+        printf("Connection closed. Ready for next connection.\n");
     }
-    tcp_socket_fd = new_socket;
 
-    printf("Connection accepted from %s:%d. Starting forwarding...\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
-
-    pthread_t tcp_thread, serial_thread;
-    pthread_create(&tcp_thread, NULL, tcp_to_serial_thread, NULL);
-    pthread_create(&serial_thread, NULL, serial_to_tcp_thread, NULL);
-
-    pthread_join(tcp_thread, NULL);
-    pthread_join(serial_thread, NULL);
-
-    close(new_socket);
+    // This code will never be reached due to infinite loop, but kept for completeness
     close(server_fd);
     close(serial_port_fd);
-
-    printf("Connection closed. Exiting.\n");
     return 0;
 }
