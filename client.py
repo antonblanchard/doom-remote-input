@@ -9,12 +9,17 @@ import socket
 import struct
 import sys
 import os
+import select
+import wad
+import audio
+
 from typing import Optional
 
 # Constants
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 65432
 EVENT_DEVICE = "/dev/input/event0"
+DEFAULT_WAD = "DOOM.WAD"
 
 PRESS_IDENTIFIER = 254
 RELEASE_IDENTIFIER = 255
@@ -35,7 +40,8 @@ INPUT_EVENT_SIZE = struct.calcsize(INPUT_EVENT_FORMAT)
 
 
 class InputEventClient:
-    def __init__(self, host: str, port: int, device: str, verbose: bool = False):
+    def __init__(self, audio: audio.AudioPlayerPool, host: str, port: int, device: str, verbose: bool = False):
+        self.audio = audio
         self.host = host
         self.port = port
         self.device = device
@@ -67,7 +73,7 @@ class InputEventClient:
             data = os.read(self.event_fd, INPUT_EVENT_SIZE)
             if len(data) != INPUT_EVENT_SIZE:
                 return None
-            
+
             # Unpack the input event structure
             tv_sec, tv_usec, event_type, code, value = struct.unpack(INPUT_EVENT_FORMAT, data)
             return event_type, code, value
@@ -83,7 +89,7 @@ class InputEventClient:
 
         identifier = PRESS_IDENTIFIER if is_press else RELEASE_IDENTIFIER
         buffer = bytes([identifier, code])
-        
+
         try:
             sent = self.sock.send(buffer)
             if sent != len(buffer):
@@ -94,42 +100,89 @@ class InputEventClient:
             print(f"Failed to send data: {e}", file=sys.stderr)
             return False
 
+    def handle_server_data(self) -> bool:
+        """Handle incoming data from server."""
+        try:
+            data = self.sock.recv(1024)
+            if not data:
+                print("Server closed connection")
+                return False
+
+            if self.verbose:
+                print(f"Received from server: {data.decode('utf-8')}")
+
+            # split data into lines
+            lines = data.split(b'\n')
+            for line in lines:
+                if line.startswith(b'P'):
+                    try:
+                        n = int(line[1:])
+                        # It's the next WAD for some reason
+                        self.audio.play_sound(n+1)
+                    except:
+                        pass
+
+            return True
+        except socket.error as e:
+            print(f"Error receiving from server: {e}", file=sys.stderr)
+            return False
+
     def run(self) -> None:
         """Main event loop."""
         self.open_device()
         self.connect_to_server()
-        
+
         print(f"Connected to {self.host}:{self.port}, reading from {self.device}")
         if self.verbose:
             print("Verbose mode enabled")
 
         try:
             while True:
-                event_data = self.read_input_event()
-                if event_data is None:
+                # Use select to poll both input device and network socket
+                ready_fds, _, error_fds = select.select(
+                    [self.event_fd, self.sock.fileno()],  # Read list
+                    [],                                    # Write list
+                    [self.sock.fileno()],                 # Error list
+                    0.1                                   # Timeout (100ms)
+                )
+
+                # Check for socket errors
+                if error_fds:
+                    print("Socket error detected")
                     break
-                
-                event_type, code, value = event_data
-                
-                # Check if the event is a key event
-                if event_type == EV_KEY:
-                    if value == 1:  # Key press
-                        if self.verbose:
-                            print(f"Key Down: {code}")
-                        if not self.send_key_event(True, code):
-                            break
-                    elif value == 0:  # Key release
-                        if self.verbose:
-                            print(f"Key Up: {code}")
-                        if not self.send_key_event(False, code):
-                            break
-                    elif value == 2:  # Key auto repeat
-                        # Ignore auto-repeat events
-                        continue
-                    else:
-                        if self.verbose:
-                            print(f"Unknown key event value: {value}")
-                        continue
+
+                # Handle input events
+                if self.event_fd in ready_fds:
+                    event_data = self.read_input_event()
+                    if event_data is None:
+                        break
+
+                    event_type, code, value = event_data
+
+                    # Check if the event is a key event
+                    if event_type == EV_KEY:
+                        if value == 1:  # Key press
+                            if self.verbose:
+                                print(f"Key Down: {code}")
+                            if not self.send_key_event(True, code):
+                                break
+                        elif value == 0:  # Key release
+                            if self.verbose:
+                                print(f"Key Up: {code}")
+                            if not self.send_key_event(False, code):
+                                break
+                        elif value == 2:  # Key auto repeat
+                            # Ignore auto-repeat events
+                            continue
+                        else:
+                            if self.verbose:
+                                print(f"Unknown key event value: {value}")
+                            continue
+
+                # Handle server data
+                if self.sock.fileno() in ready_fds:
+                    if not self.handle_server_data():
+                        break
 
         except KeyboardInterrupt:
             print("\nInterrupted by user")
@@ -144,7 +197,7 @@ class InputEventClient:
             except OSError:
                 pass
             self.event_fd = None
-        
+
         if self.sock is not None:
             try:
                 self.sock.close()
@@ -174,12 +227,20 @@ def main():
         help=f"Specify the device name (default: {EVENT_DEVICE})"
     )
     parser.add_argument(
+        "-w", "--wad",
+        default=DEFAULT_WAD,
+        help=f"Specify the DOOM WAD file (default: {DEFAULT_WAD})"
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose output"
     )
 
     args = parser.parse_args()
+
+    w = wad.Wad(args.wad)
+    s = audio.AudioPlayerPool(w.lumps)
 
     # Check if device exists
     if not os.path.exists(args.device):
@@ -192,7 +253,7 @@ def main():
         print("Try running with sudo or adding your user to the input group", file=sys.stderr)
         sys.exit(1)
 
-    client = InputEventClient(args.host, args.port, args.device, args.verbose)
+    client = InputEventClient(s, args.host, args.port, args.device, args.verbose)
     client.run()
 
 
