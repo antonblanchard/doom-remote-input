@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <termios.h>
 #include <fcntl.h>
+#include <ctype.h>
 
 #define PORT 65432
 #define DEVICE "/dev/ttyUSB0"
@@ -156,14 +157,27 @@ static void *tcp_to_serial_thread(void* arg)
 }
 
 // Thread to read from serial port and write to TCP socket
-static void *serial_to_stdout_thread(void* arg)
+static void *serial_to_tcp_thread(void* arg)
 {
     char buffer[TX_BUFFER_SIZE];
     ssize_t bytes_read;
     while ((bytes_read = read(serial_port_fd, buffer, sizeof(buffer))) > 0) {
-        if (write(STDOUT_FILENO, buffer, bytes_read) != bytes_read) {
-            perror("write");
-            exit(1);
+        if (verbose) {
+            printf("Serial->TCP: ");
+            for (int i = 0; i < bytes_read; i++) {
+                printf("%02x ", (unsigned char)buffer[i]);
+            }
+            printf("(");
+            for (int i = 0; i < bytes_read; i++) {
+                printf("%c", isprint(buffer[i]) ? buffer[i] : '.');
+            }
+            printf(")\n");
+        }
+        
+        // Send data to TCP client
+        if (send(tcp_socket_fd, buffer, bytes_read, 0) != bytes_read) {
+            perror("Failed to send serial data to TCP client");
+            break;
         }
     }
 
@@ -172,11 +186,14 @@ static void *serial_to_stdout_thread(void* arg)
 
 static void usage(const char *prog_name)
 {
-    fprintf(stderr, "Usage: %s -p <port> -d <device> -b <baud>\n\n", prog_name);
+    fprintf(stderr, "Usage: %s [options]\n\n", prog_name);
+    fprintf(stderr, "TCP to Serial forwarder with bidirectional communication.\n");
+    fprintf(stderr, "Forwards TCP data to serial port and serial responses back to TCP client.\n\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -p, --port <number>     Specify the port number (default %d).\n", PORT);
     fprintf(stderr, "  -d, --device <path>     Specify the serial device (default %s).\n", DEVICE);
     fprintf(stderr, "  -b, --baud <rate>       Specify the baud rate (default %d).\n", BAUD_RATE);
+    fprintf(stderr, "  -v, --verbose           Enable verbose output.\n");
     fprintf(stderr, "  -h, --help              Display this help message and exit.\n");
 }
 
@@ -187,7 +204,7 @@ int main(int argc, char *argv[])
     int baud = BAUD_RATE;
     int c;
     int option_index = 0;
-    const char *short_options = "hp:d:b:";
+    const char *short_options = "hp:d:b:v";
     static const struct option long_options[] = {
         {"port",    required_argument, 0, 'p'},
         {"device",  required_argument, 0, 'd'},
@@ -253,8 +270,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    pthread_t serial_thread;
-    pthread_create(&serial_thread, NULL, serial_to_stdout_thread, NULL);
     printf("Server listening on port %d and forwarding to %s...\n", port, device);
 
     // Main server loop - accept connections continuously
@@ -269,14 +284,19 @@ int main(int argc, char *argv[])
         }
         tcp_socket_fd = new_socket;
 
-        printf("Connection accepted from %s:%d. Starting forwarding...\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
+        printf("Connection accepted from %s:%d. Starting bidirectional forwarding...\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
 
-        pthread_t tcp_thread;
-        pthread_create(&tcp_thread, NULL, tcp_to_serial_thread, NULL);
+        // Create both threads for bidirectional communication
+        pthread_t tcp_to_serial_thread_handle;
+        pthread_t serial_to_tcp_thread_handle;
+        
+        pthread_create(&tcp_to_serial_thread_handle, NULL, tcp_to_serial_thread, NULL);
+        pthread_create(&serial_to_tcp_thread_handle, NULL, serial_to_tcp_thread, NULL);
 
-        // Wait for threads to finish (connection closed)
-        pthread_join(tcp_thread, NULL);
+        // Wait for the TCP to serial thread to finish
+        pthread_join(tcp_to_serial_thread_handle, NULL);
 
+        pthread_cancel(serial_to_tcp_thread_handle);
         close(new_socket);
         printf("Connection closed. Ready for next connection.\n");
     }
